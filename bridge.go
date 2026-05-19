@@ -168,6 +168,9 @@ func tikv_go_txn_begin(client_handle C.uint64_t, isolation C.int, out_error **C.
 		*out_error_len = C.int(len(msg))
 		return 0
 	}
+    txn.SetEnable1PC(true)
+    txn.SetEnableAsyncCommit(true)
+
 	*out_error = nil
 	*out_error_len = 0
 	h := cgo.NewHandle(txn)
