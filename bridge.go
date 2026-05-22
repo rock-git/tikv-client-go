@@ -1,9 +1,45 @@
 package main
 
 /*
+#cgo CFLAGS: -D_GNU_SOURCE
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
+// Default name applied to the loader thread during library load. All Go
+// runtime worker threads (M's) cloned from this thread afterwards inherit
+// this name on Linux, so sysmon / GC / scheduler M's also show up as
+// "tikvgo" in ps / top / perf without per-call overhead.
+#define TIKV_GO_DEFAULT_THREAD_NAME "tikvgo"
+
+// Rename the calling OS thread. Linux truncates to 15 bytes + NUL.
+static inline int tikv_go_set_thread_name(const char* name) {
+#if defined(__APPLE__)
+    return pthread_setname_np(name);
+#elif defined(__linux__)
+    return pthread_setname_np(pthread_self(), name);
+#else
+    (void)name;
+    return 0;
+#endif
+}
+
+// Library-load constructor: runs before the Go runtime initializes, so
+// every M the runtime later clones inherits this comm value on Linux.
+__attribute__((constructor))
+static void tikv_go_init_thread_name(void) {
+#if defined(__linux__)
+    // prctl is the lowest-level path and is safe pre-runtime-init.
+    // prctl(PR_SET_NAME, (unsigned long)TIKV_GO_DEFAULT_THREAD_NAME, 0, 0, 0);
+    pthread_setname_np(pthread_self(), TIKV_GO_DEFAULT_THREAD_NAME);
+#elif defined(__APPLE__)
+    pthread_setname_np(TIKV_GO_DEFAULT_THREAD_NAME);
+#endif
+}
 
 // Result carrying optional data bytes and optional error string.
 typedef struct {
@@ -46,6 +82,7 @@ import "C"
 import (
 	"bytes"
 	"context"
+	"runtime"
 	"runtime/cgo"
 	"unsafe"
 
@@ -54,6 +91,29 @@ import (
 )
 
 func main() {}
+
+// tikv_go_set_max_procs sets the maximum number of CPUs that can execute Go
+// code simultaneously (equivalent to runtime.GOMAXPROCS). If n < 1, it does
+// not change the current setting. Returns the previous setting.
+//
+// Safe to call multiple times at runtime. Note: this controls Go's P count;
+// it does NOT cap OS threads (M) created for blocking CGO calls.
+//
+//export tikv_go_set_max_procs
+func tikv_go_set_max_procs(n C.int) C.int {
+	return C.int(runtime.GOMAXPROCS(int(n)))
+}
+
+// tikv_go_set_runtime_thread_name renames the calling OS thread. Intended
+// to be invoked once by the C/C++ host very early (before creating any
+// tikv client) to override the default "tikvgo" name applied by the
+// library-load constructor. On Linux the new name is inherited by every
+// Go runtime M cloned from this thread afterwards.
+//
+//export tikv_go_set_runtime_thread_name
+func tikv_go_set_runtime_thread_name(name *C.char) C.int {
+	return C.tikv_go_set_thread_name(name)
+}
 
 // ---------------------------------------------------------------------------
 // Helper: allocate a CAsyncResult on the C heap and populate it.
